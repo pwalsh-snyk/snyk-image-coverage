@@ -1,0 +1,12 @@
+# One image reference per line. Lines starting with # are ignored.
+# Export from a machine where kubectl works, then run:
+#   python reconcile.py --images-file cluster-images.txt
+#
+# Example kubectl + jq:
+# kubectl get pods -A -o json | jq -r '
+#   .items[]
+#   | (.spec.containers // []) + (.spec.initContainers // []) + (.spec.ephemeralContainers // [])
+#   | .[]
+#   | .image
+#   | select(. != null)
+# ' | sort -u > cluster-images.txt
