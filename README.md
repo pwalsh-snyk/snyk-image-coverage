@@ -1,10 +1,21 @@
 # snyk-image-coverage
 
-Reconcile **container images running on AKS** with **Snyk container projects** in your organization. The script authenticates with Azure, discovers clusters (optionally scoped to a resource group), lists images from all pods, compares them to projects returned by the Snyk REST API, and **imports** unmatched images through the right **container registry integration** (ACR, ECR, MCR, Docker Hub, etc., depending on what you configure).
+## Purpose
 
-You do **not** need local `kubectl` or a kubeconfig file: credentials come from the Azure Resource Manager API (`list_cluster_user_credentials`) using [DefaultAzureCredential](https://learn.microsoft.com/en-us/python/api/azure-identity/azure.identity.defaultazurecredential).
+This script helps you **close the gap between what is actually running in your cluster and what Snyk already tracks**. It discovers **container images deployed on your AKS workloads** (every distinct image reference from running pods), compares them to your Snyk org’s **container projects**, and for anything **not yet represented in Snyk** it calls Snyk’s **import API**. Each import queues Snyk to pull and scan that image via the **registry integration** you configured (ACR, MCR, ECR, Docker Hub, etc.). The goal is **coverage**: workloads on the cluster get corresponding container projects in Snyk without manually importing image by image.
 
-Matching is **heuristic**: normalized `registry/repo:tag` strings are compared to project names and related attributes. Images referenced only by digest (`image@sha256:...`) may not align with Snyk project names that use tags—extend or tune matching if needed for your environment.
+Matching existing projects is **heuristic**: normalized `registry/repo:tag` strings are compared to project names and related fields in the Snyk REST API. Images referenced only by digest (`...@sha256:...`) may not line up with project names that use tags—extend `reconcile.py` if your environment needs tighter matching.
+
+## How it works
+
+1. **Azure** — Uses [DefaultAzureCredential](https://learn.microsoft.com/en-us/python/api/azure-identity/azure.identity.defaultazurecredential) (`az login`, service principal, managed identity, etc.) against the subscription(s) in `AZURE_SUBSCRIPTION_ID`, optionally limited by `AZURE_RESOURCE_GROUP`.
+2. **Discover clusters** — Lists AKS managed clusters in those subscriptions via the Azure Resource Manager API.
+3. **Cluster API access** — For each cluster, obtains a short-lived **kubeconfig** from Azure (`list_cluster_user_credentials`); no kubeconfig files or cluster admin kubeconfig on disk are required.
+4. **List running images** — Uses the Kubernetes Python client to **list pods in all namespaces** and collects images from regular containers, init containers, and ephemeral containers.
+5. **Snyk inventory** — Paginates your org’s projects from the **Snyk REST API** and derives normalized keys from project names and container-related attributes.
+6. **Reconcile** — Any cluster image that does not match the known set is treated as missing; the script **POSTs** to Snyk’s **v1 import** endpoint with the appropriate **integration ID** (from `SNYK_INTEGRATION_ID` or per-registry overrides like `SNYK_INTEGRATION_ID_ACR`). The request strips the registry hostname from the image ref where Snyk expects only the repository path for that integration.
+
+If you cannot or do not want to talk to Azure for a given run, you can pass **`--images-file`** with one image reference per line; the same reconcile and import steps run against that static list.
 
 ## Prerequisites
 
@@ -65,13 +76,13 @@ The script reads `AZURE_SUBSCRIPTION_ID` from `.env` (comma-separated for multip
 python reconcile.py
 ```
 
-**Static image list** (no Azure calls; path must resolve under this repo or your current working directory):
+**Static image list** (skips Azure discovery; path must resolve under this repo or your current working directory):
 
 ```bash
 python reconcile.py --images-file cluster-images.txt
 ```
 
-See `cluster-images.example.txt` for a template and a `kubectl`/`jq` one-liner to build the file from a cluster you can reach.
+See `cluster-images.example.txt` for the line-oriented file format.
 
 **Wait for each import job** (slower; debugging):
 
