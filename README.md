@@ -35,10 +35,9 @@ If you cannot or do not want to talk to Azure for a given run, you can pass **`-
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env
 ```
 
-Edit `.env` with your values (see [Configuration](#configuration)).
+Edit `.env` in the repo root with your values (see [Configuration](#configuration)). Once it contains secrets, do not commit or push `.env`—keep those changes local only.
 
 ### Azure sign-in
 

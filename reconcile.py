@@ -40,8 +40,7 @@ Environment variables (set in .env):
 
 Usage:
   1. az login  (or set AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_ID for SP auth)
-  2. cp .env.example .env  # fill in SNYK_TOKEN, SNYK_ORG_ID, SNYK_INTEGRATION_ID,
-                           # AZURE_SUBSCRIPTION_ID
+  2. Edit .env: SNYK_TOKEN, SNYK_ORG_ID, SNYK_INTEGRATION_ID, AZURE_SUBSCRIPTION_ID
   3. pip install -r requirements.txt
   4. python reconcile.py
 
