@@ -14,6 +14,7 @@ Matching existing projects is **heuristic**: normalized `registry/repo:tag` stri
 4. **List running images** — Uses the Kubernetes Python client to **list pods in all namespaces** and collects images from regular containers, init containers, and ephemeral containers.
 5. **Snyk inventory** — Paginates your org’s projects from the **Snyk REST API** and derives normalized keys from project names and container-related attributes.
 6. **Reconcile** — Any cluster image that does not match the known set is treated as missing; the script **POSTs** to Snyk’s **v1 import** endpoint with the appropriate **integration ID** (from `SNYK_INTEGRATION_ID` or per-registry overrides like `SNYK_INTEGRATION_ID_ACR`). The request strips the registry hostname from the image ref where Snyk expects only the repository path for that integration.
+7. **Tag imported projects (default)** — For each import, the script **polls the import job** until it finishes, reads the created **project id(s)** from the job payload, and **POSTs** Snyk **project tags** (v1 API: `.../project/{projectId}/tags`). By default it applies **`image` = `deployed`** so you can filter reports on *deployed* workload images. Disable or override with `SNYK_TAG_IMPORTED_PROJECTS` and `SNYK_IMPORT_TAG_KEY` / `SNYK_IMPORT_TAG_VALUE` (see configuration).
 
 If you cannot or do not want to talk to Azure for a given run, you can pass **`--images-file`** with one image reference per line; the same reconcile and import steps run against that static list.
 
@@ -63,8 +64,11 @@ The script reads `AZURE_SUBSCRIPTION_ID` from `.env` (comma-separated for multip
 | `SNYK_INTEGRATION_ID_MCR` | No | `mcr.microsoft.com` |
 | `SNYK_INTEGRATION_ID_DOCKER_HUB` | No | Docker Hub / implicit `library/...` |
 | `SNYK_REST_BASE` | No | Default `https://api.snyk.io` |
-| `SNYK_V1_BASE` | No | v1 import host; default `https://snyk.io` (imports may redirect to `app.snyk.io`) |
+| `SNYK_V1_BASE` | No | v1 import + project-tags host; default `https://snyk.io` (imports may redirect to `app.snyk.io`) |
 | `SNYK_REST_VERSION` | No | Default `2024-10-15` |
+| `SNYK_TAG_IMPORTED_PROJECTS` | No | If `1`/`true`/unset: tag new projects after import (default). Set `0`/`false`/`no` to skip. |
+| `SNYK_IMPORT_TAG_KEY` | No | Project tag **key** (default `image`) |
+| `SNYK_IMPORT_TAG_VALUE` | No | Project tag **value** (default `deployed`) |
 
 \*Not required when using `--images-file` only (no cluster discovery).
 
@@ -99,6 +103,7 @@ Exit code `0` means success or nothing to do; non-zero indicates missing configu
 - **Addon images (`mcr.microsoft.com/...`)** — Use an integration that can pull from MCR, or skip system images via a filtered `--images-file` workflow.
 - **Snyk REST shows 0 projects** — Normal for an empty org; first run imports everything that does not match.
 - **`CERTIFICATE_VERIFY_FAILED` to `api.snyk.io`** — Common on some macOS Python installs. Try `export SSL_CERT_FILE=$(python -c "import certifi; print(certifi.where())")` after `pip install certifi`.
+- **Tagging: “could not find project ids in import job”** — Snyk may return a different job JSON shape than this script parses, or the job failed before projects were created. Use `python reconcile.py --wait-import` once and inspect the job response; open an issue with a redacted sample if it persists.
 
 ## Scheduling
 

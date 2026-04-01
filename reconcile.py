@@ -32,6 +32,12 @@ Environment variables (set in .env):
     SNYK_V1_BASE           Snyk v1 API base (default: https://snyk.io)
     SNYK_REST_VERSION      REST API version (default: 2024-10-15)
 
+  Optional tagging (after each successful import job completes):
+    SNYK_TAG_IMPORTED_PROJECTS  If unset or 1/true/yes: apply Snyk project tags (default on).
+                                Set to 0/false/no to skip.
+    SNYK_IMPORT_TAG_KEY       Tag key (default: image)
+    SNYK_IMPORT_TAG_VALUE     Tag value (default: deployed)
+
 Usage:
   1. az login  (or set AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_ID for SP auth)
   2. cp .env.example .env  # fill in SNYK_TOKEN, SNYK_ORG_ID, SNYK_INTEGRATION_ID,
@@ -88,6 +94,9 @@ except ImportError:
 
 DEFAULT_REST_VERSION = "2024-10-15"
 V1_IMPORT_PATH = "/api/v1/org/{org_id}/integrations/{integration_id}/import"
+V1_PROJECT_TAGS_PATH = "/api/v1/org/{org_id}/project/{project_id}/tags"
+DEFAULT_IMPORT_TAG_KEY = "image"
+DEFAULT_IMPORT_TAG_VALUE = "deployed"
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +118,19 @@ class IntegrationRouting:
 def _env_optional(key: str) -> str | None:
     v = os.environ.get(key, "").strip()
     return v or None
+
+
+def _env_truthy(key: str, *, default: bool = True) -> bool:
+    """Parse env var as boolean; unknown non-empty strings keep `default`."""
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    s = raw.strip().lower()
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    if s in ("1", "true", "yes", "on"):
+        return True
+    return default
 
 
 def load_integration_routing() -> IntegrationRouting | None:
@@ -403,6 +425,114 @@ def import_image_v1(
     return False, r.text
 
 
+def project_ids_from_import_job(payload: dict) -> list[str]:
+    """Collect Snyk project UUIDs from a finished import-job JSON body."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(pid: object) -> None:
+        if isinstance(pid, str) and pid not in seen:
+            seen.add(pid)
+            out.append(pid)
+
+    for list_key in ("projects", "createdProjects", "projectIds"):
+        chunk = payload.get(list_key)
+        if not isinstance(chunk, list):
+            continue
+        for item in chunk:
+            if isinstance(item, str):
+                add(item)
+            elif isinstance(item, dict):
+                if item.get("success") is False:
+                    continue
+                add(item.get("id") or item.get("projectId") or item.get("project_id"))
+
+    for nest_key in ("log", "logs", "results", "projectsLog"):
+        nested = payload.get(nest_key)
+        if not isinstance(nested, list):
+            continue
+        for item in nested:
+            if not isinstance(item, dict):
+                continue
+            sub = item.get("projects")
+            if isinstance(sub, list):
+                for p in sub:
+                    if not isinstance(p, dict):
+                        continue
+                    if p.get("success") is False:
+                        continue
+                    add(p.get("projectId") or p.get("id") or p.get("project_id"))
+            else:
+                if item.get("success") is False:
+                    continue
+                add(item.get("projectId") or item.get("id") or item.get("project_id"))
+
+    return out
+
+
+def add_project_tags(
+    session: requests.Session,
+    v1_base: str,
+    org_id: str,
+    project_id: str,
+    tags: list[tuple[str, str]],
+) -> tuple[bool, str]:
+    """
+    POST key/value tags to one project (one tag per request).
+
+    Snyk v1 expects each call as {"key": "...", "value": "..."}, not {"tags": [...]}.
+    """
+    url = f"{v1_base.rstrip('/')}" + V1_PROJECT_TAGS_PATH.format(
+        org_id=org_id, project_id=project_id
+    )
+    for k, v in tags:
+        r = session.post(url, json={"key": k, "value": v})
+        if r.status_code in (200, 201, 204):
+            continue
+        if r.status_code == 409:
+            continue
+        if r.status_code == 422 and r.text and "already applied" in r.text:
+            continue
+        return False, r.text or r.reason
+    return True, ""
+
+
+def tag_projects_from_import_job(
+    session: requests.Session,
+    v1_base: str,
+    org_id: str,
+    job_payload: dict,
+    tags: list[tuple[str, str]],
+    context: str,
+) -> int:
+    """
+    Apply tags to every project id found in a completed import job.
+    Returns the number of failed tag operations.
+    """
+    if not tags:
+        return 0
+    pids = project_ids_from_import_job(job_payload)
+    if not pids:
+        print(
+            f"  warning: could not find project ids in import job to apply tags ({context})",
+            file=sys.stderr,
+        )
+        return 0
+    failures = 0
+    for pid in pids:
+        ok, err = add_project_tags(session, v1_base, org_id, pid, tags)
+        if ok:
+            label = ", ".join(f"{k}={v}" for k, v in tags)
+            print(f"  tagged {context} project {pid} ({label})", flush=True)
+        else:
+            print(
+                f"  tag failed for project {pid} ({context}): {err[:500]}",
+                file=sys.stderr,
+            )
+            failures += 1
+    return failures
+
+
 def poll_import_job(session: requests.Session, job_url: str, interval_sec: float = 5.0) -> dict:
     while True:
         r = session.get(job_url)
@@ -482,6 +612,13 @@ def main() -> int:
         print("Set SNYK_TOKEN, SNYK_ORG_ID, and SNYK_INTEGRATION_ID.", file=sys.stderr)
         return 1
 
+    tag_imported = _env_truthy("SNYK_TAG_IMPORTED_PROJECTS", default=True)
+    tag_key = (_env_optional("SNYK_IMPORT_TAG_KEY") or DEFAULT_IMPORT_TAG_KEY).strip()
+    tag_value = (_env_optional("SNYK_IMPORT_TAG_VALUE") or DEFAULT_IMPORT_TAG_VALUE).strip()
+    tag_pairs: list[tuple[str, str]] = (
+        [(tag_key, tag_value)] if tag_imported and tag_key and tag_value else []
+    )
+
     # --- Collect images ---
     if args.images_file:
         img_path = resolve_images_file_path(_root, args.images_file)
@@ -554,23 +691,37 @@ def main() -> int:
     print(f"\n{len(missing)} images not matched; importing:")
     for m in missing:
         print(f"  - {m}")
+    if tag_pairs:
+        print(
+            f"\nAfter each import completes, projects get tag "
+            f"{tag_key}={tag_value} "
+            f"(override with SNYK_IMPORT_TAG_*; disable with SNYK_TAG_IMPORTED_PROJECTS=0).",
+            flush=True,
+        )
 
     failures = 0
     for img in missing:
         iid = integration_id_for_image(img, routing)
         ok, detail = import_image_v1(v1_session, v1_base, org_id, iid, img)
-        if ok:
-            print(f"Import started: {img} -> {detail}")
-            if args.wait_import and detail:
-                try:
-                    final = poll_import_job(v1_session, detail)
-                    print(f"  job status: {final.get('status')} {final.get('error', '')}")
-                except Exception as e:
-                    print(f"  poll failed: {e}", file=sys.stderr)
-                    failures += 1
-        else:
+        if not ok:
             print(f"Import failed: {img} -> {detail}", file=sys.stderr)
             failures += 1
+            continue
+        print(f"Import started: {img} -> {detail}")
+        poll_for_job = bool(detail) and (args.wait_import or bool(tag_pairs))
+        if poll_for_job and detail:
+            try:
+                final = poll_import_job(v1_session, detail)
+            except Exception as e:
+                print(f"  import job poll failed ({img}): {e}", file=sys.stderr)
+                failures += 1
+                continue
+            if args.wait_import:
+                print(f"  job status: {final.get('status')} {final.get('error', '')}")
+            if tag_pairs:
+                failures += tag_projects_from_import_job(
+                    v1_session, v1_base, org_id, final, tag_pairs, context=img
+                )
 
     return 1 if failures else 0
 
