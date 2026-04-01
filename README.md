@@ -4,7 +4,19 @@
 
 This script helps you **close the gap between what is actually running in your cluster and what Snyk already tracks**. It discovers **container images deployed on your AKS workloads** (every distinct image reference from running pods), compares them to your Snyk org’s **container projects**, and for anything **not yet represented in Snyk** it calls Snyk’s **import API**. Each import queues Snyk to pull and scan that image via the **registry integration** you configured (ACR, MCR, ECR, Docker Hub, etc.). The goal is **coverage**: workloads on the cluster get corresponding container projects in Snyk without manually importing image by image.
 
-Matching existing projects is **heuristic**: normalized `registry/repo:tag` strings are compared to project names and related fields in the Snyk REST API. Images referenced only by digest (`...@sha256:...`) may not line up with project names that use tags—extend `reconcile.py` if your environment needs tighter matching.
+## Matching cluster images to Snyk
+
+When you import a container image, Snyk’s model is **digest-centric**: the scan is tied to the immutable layer identity you get from the registry (the same digest Kubernetes resolves when it pulls the image). The REST API exposes that in places like project **attributes** (e.g. `imageId` / `image_id`, target reference fields) and via **Container image** endpoints (`/rest/orgs/{org_id}/container_images`, …), which are keyed by Snyk’s own image identifiers.
+
+**Yes — matching on that identity (ultimately the digest) is the right long-term approach** and avoids fragile “same tag string” comparisons.
+
+This script’s implementation is still **mostly string-heuristic** on the **Projects** list: it normalizes full image strings and compares them to project names plus a handful of attribute values copied into a single `known` set (including `imageId` where the API returns it). It does **not** yet:
+
+- Treat **`sha256:…` as a first-class join key** on both sides (for example, if the workload string is `registry/app@sha256:abc…` but Snyk’s stored fields surface only digest-shaped values, the script does not reliably declare a match unless those strings happen to coincide after normalization).
+
+- Pull **resolved** image identities from pod **status** (e.g. `containerStatuses[].imageID`), only the **spec** `image` strings. So pods that specify `image: myrepo/app:1.2` while the node is running digest `sha256:…` may not contribute a digest on the cluster side for the script to compare — even though Snyk may only “look like” digest + repo in the UI/API.
+
+So mismatches remain possible (digest-only spec, tag-only spec, multi-arch digest variance, or API field shapes that do not land in the attributes this script reads). **Tighter matching** would mean extending `reconcile.py`: collect runtime image IDs (and/or canonical digests) from the cluster, normalize digests from Snyk project/container-image responses, and reconcile on **digest equality** (with a tag/name fallback if you still want it).
 
 ## How it works
 

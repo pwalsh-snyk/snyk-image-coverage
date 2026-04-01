@@ -7,8 +7,8 @@ Flow:
      environment variables, managed identity, etc. — no kubectl required).
   2. Discover all AKS clusters in the configured subscription (optionally scoped to
      a resource group) and fetch per-cluster kubeconfigs via the Azure API.
-  3. Query running pod images from each cluster using the Kubernetes Python client.
-  4. Paginate Snyk REST projects and build a set of known image refs.
+  3. Query running pod images from each cluster (spec image + status containerStatuses image_id digests).
+  4. Paginate Snyk REST projects and build a set of known image refs and sha256 keys.
   5. For images not matched, POST to the Snyk v1 import API using the integration
      that matches the image registry.
 
@@ -28,6 +28,9 @@ Environment variables (set in .env):
 
   Optional scoping:
     AZURE_RESOURCE_GROUP   Limit cluster discovery to one resource group
+    INCLUDE_KUBE_SYSTEM    If 1/true/yes: include pods in kube-system (default: exclude them).
+
+  Optional discovery / API:
     SNYK_REST_BASE         Snyk REST API base (default: https://api.snyk.io)
     SNYK_V1_BASE           Snyk v1 API base (default: https://snyk.io)
     SNYK_REST_VERSION      REST API version (default: 2024-10-15)
@@ -46,6 +49,10 @@ Usage:
 
 Override cluster discovery with a static image list:
   python reconcile.py --images-file images.txt
+
+Include addon/system images from kube-system (default is to skip that namespace):
+  python reconcile.py --include-kube-system
+  # or INCLUDE_KUBE_SYSTEM=1 in .env
 
 Cron (hourly):
   0 * * * * cd /path/to/snyk-image-coverage && .venv/bin/python reconcile.py >> /var/log/snyk-reconcile.log 2>&1
@@ -96,6 +103,7 @@ V1_IMPORT_PATH = "/api/v1/org/{org_id}/integrations/{integration_id}/import"
 V1_PROJECT_TAGS_PATH = "/api/v1/org/{org_id}/project/{project_id}/tags"
 DEFAULT_IMPORT_TAG_KEY = "image"
 DEFAULT_IMPORT_TAG_VALUE = "deployed"
+KUBE_SYSTEM_NAMESPACE = "kube-system"
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +256,19 @@ def discover_aks_clusters(
     ]
 
 
-def collect_cluster_images(core_v1: k8s_client.CoreV1Api) -> set[str]:
-    """Return the set of unique image references from all running pods."""
+def collect_cluster_images(
+    core_v1: k8s_client.CoreV1Api,
+    *,
+    include_kube_system: bool = False,
+) -> set[str]:
+    """
+    Return unique image references from all running pods: spec image strings plus
+    resolved content digests from status (containerStatuses[].image_id).
+
+    By default, pods in the ``kube-system`` namespace are skipped to avoid
+    continually importing cluster addon images. Set ``include_kube_system=True``
+    to include them.
+    """
     images: set[str] = set()
     try:
         pods = core_v1.list_pod_for_all_namespaces(watch=False)
@@ -259,18 +278,31 @@ def collect_cluster_images(core_v1: k8s_client.CoreV1Api) -> set[str]:
         raise RuntimeError(f"Could not reach the cluster API server: {e}") from e
 
     for pod in pods.items:
-        spec = pod.spec
-        if not spec:
+        ns = (pod.metadata.namespace if pod.metadata else None) or ""
+        if not include_kube_system and ns == KUBE_SYSTEM_NAMESPACE:
             continue
-        for container in (spec.containers or []) + (spec.init_containers or []) + (spec.ephemeral_containers or []):
-            if container.image:
-                images.add(container.image.strip())
+        spec = pod.spec
+        if spec:
+            for container in (spec.containers or []) + (spec.init_containers or []) + (
+                spec.ephemeral_containers or []
+            ):
+                if container.image:
+                    images.add(container.image.strip())
+        status = pod.status
+        if status:
+            for cs in (status.container_statuses or []) + (status.init_container_statuses or []) + (
+                status.ephemeral_container_statuses or []
+            ):
+                if cs.image_id:
+                    images.add(strip_docker_pullable_prefix(cs.image_id))
     return images
 
 
 def collect_all_images(
     subscription_ids: list[str],
     resource_group: str | None = None,
+    *,
+    include_kube_system: bool = False,
 ) -> set[str]:
     """
     Discover all AKS clusters across the given subscriptions and collect
@@ -292,9 +324,17 @@ def collect_all_images(
 
         for sub, rg, name in clusters:
             print(f"  Collecting images from cluster: {name} (resource group: {rg})", flush=True)
+            if not include_kube_system:
+                print(
+                    f"    (skipping namespace {KUBE_SYSTEM_NAMESPACE!r}; "
+                    "use --include-kube-system or INCLUDE_KUBE_SYSTEM=1 to include)",
+                    flush=True,
+                )
             try:
                 core_v1 = make_k8s_core_v1(sub, rg, name)
-                images = collect_cluster_images(core_v1)
+                images = collect_cluster_images(
+                    core_v1, include_kube_system=include_kube_system
+                )
                 print(f"    {len(images)} unique image references found.")
                 all_images.update(images)
             except Exception as e:
@@ -312,10 +352,28 @@ def normalize_image_ref(ref: str) -> str:
     return re.sub(r"\s+", "", s)
 
 
+_DOCKER_PULLABLE_PREFIX = "docker-pullable://"
+_SHA256_DIGEST = re.compile(r"(?i)sha256:([a-f0-9]{64})")
+
+
+def strip_docker_pullable_prefix(image_id: str) -> str:
+    s = image_id.strip()
+    if s.startswith(_DOCKER_PULLABLE_PREFIX):
+        return s[len(_DOCKER_PULLABLE_PREFIX) :].strip()
+    return s
+
+
+def extract_sha256_digest(ref: str) -> str | None:
+    """Return canonical ``sha256:<64-hex>`` if present, else None."""
+    m = _SHA256_DIGEST.search(ref)
+    if m:
+        return f"sha256:{m.group(1).lower()}"
+    return None
+
+
 def strip_digest(ref: str) -> str:
-    if "@sha256:" in ref:
-        return ref.split("@sha256:", 1)[0].strip()
-    return ref.strip()
+    parts = re.split(r"@sha256:", ref, maxsplit=1, flags=re.IGNORECASE)
+    return parts[0].strip()
 
 
 def strip_registry_hostname(ref: str) -> str:
@@ -340,6 +398,114 @@ def strip_registry_hostname(ref: str) -> str:
     return ref
 
 
+def add_matching_keys_from_string(keys: set[str], raw: str) -> None:
+    """
+    Add normalized ref keys for Snyk-side strings (names, imageId, target refs),
+    using the same rules as cluster-side tokens: strip docker-pullable,
+    normalize, repo@tag without digest, and standalone sha256 digest.
+    """
+    if not raw.strip():
+        return
+    cleaned = strip_docker_pullable_prefix(raw.strip())
+    if not cleaned:
+        return
+    keys.add(normalize_image_ref(cleaned))
+    keys.add(normalize_image_ref(strip_digest(cleaned)))
+    d = extract_sha256_digest(cleaned)
+    if d:
+        keys.add(d)
+
+
+def cluster_image_matches_snyk(img: str, known: set[str]) -> bool:
+    """True if this cluster image string matches any known Snyk key (ref or digest)."""
+    cleaned = strip_docker_pullable_prefix(img.strip())
+    n = normalize_image_ref(cleaned)
+    n_base = normalize_image_ref(strip_digest(cleaned))
+    digest = extract_sha256_digest(cleaned)
+    if n in known or n_base in known or (digest and digest in known):
+        return True
+    if n.startswith("docker.io/"):
+        short = n[len("docker.io/") :]
+        sn = normalize_image_ref(short)
+        sb = normalize_image_ref(strip_digest(short))
+        sd = extract_sha256_digest(short)
+        if sn in known or sb in known or (sd and sd in known):
+            return True
+    return False
+
+
+def repo_base_image_path(ref: str) -> str:
+    """
+    Repository path without registry host, image tag, or digest — used to relate
+    a ``repo:tag`` spec string to a ``repo@sha256:…`` runtime id for the same image.
+    """
+    s = strip_docker_pullable_prefix(ref.strip())
+    if not s:
+        return ""
+    if re.fullmatch(r"(?i)sha256:[a-f0-9]{64}", s):
+        return normalize_image_ref(s)
+    s = strip_digest(s)
+    s = strip_registry_hostname(s)
+    if "/" in s:
+        repo, last = s.rsplit("/", 1)
+        if ":" in last:
+            last = last.split(":", 1)[0]
+        s = f"{repo}/{last}" if repo else last
+    elif ":" in s:
+        s = s.split(":", 1)[0]
+    return normalize_image_ref(s)
+
+
+def pick_representative_for_import(refs: list[str]) -> str:
+    """Prefer a ``:tag`` style ref for Snyk import so the UI groups on a tag name."""
+    if len(refs) == 1:
+        return refs[0]
+
+    def sort_key(r: str) -> tuple[int, int]:
+        c = strip_docker_pullable_prefix(r.strip())
+        before_at, _, tail = c.partition("@")
+        has_tag = ":" in before_at and not re.match(r"(?i)^sha256:", before_at)
+        # 0 = has tag before @, 1 = digest-only / bare repo@sha
+        tier = 0 if has_tag else (1 if tail.lower().startswith("sha256:") else 2)
+        return (tier, len(c))
+
+    return sorted(refs, key=sort_key)[0]
+
+
+def dedupe_cluster_images_by_content(refs: set[str]) -> set[str]:
+    """
+    Collapse tag + digest variants that refer to the same image (typical when
+    mixing pod ``spec.image`` with ``status.image_id``) to one import target
+    per content digest.
+    """
+    by_digest: dict[str, list[str]] = {}
+    without_digest: list[str] = []
+
+    for r in refs:
+        d = extract_sha256_digest(r)
+        if d:
+            by_digest.setdefault(d, []).append(r)
+        else:
+            without_digest.append(r)
+
+    digest_by_repo_base: dict[str, list[str]] = {}
+    for d, group in by_digest.items():
+        digest_by_repo_base.setdefault(repo_base_image_path(group[0]), []).append(d)
+
+    out: set[str] = set()
+    for group in by_digest.values():
+        out.add(pick_representative_for_import(group))
+
+    for r in without_digest:
+        rb = repo_base_image_path(r)
+        d_for_repo = digest_by_repo_base.get(rb, [])
+        if len(d_for_repo) == 1:
+            continue
+        out.add(r)
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Snyk helpers
 # ---------------------------------------------------------------------------
@@ -349,13 +515,11 @@ def snyk_project_image_keys(project: dict) -> set[str]:
     attrs = project.get("attributes") or {}
     name = attrs.get("name")
     if isinstance(name, str) and name:
-        keys.add(normalize_image_ref(name))
-        keys.add(normalize_image_ref(strip_digest(name)))
+        add_matching_keys_from_string(keys, name)
     for key in ("imageId", "image_id", "targetReference", "target_reference"):
         val = attrs.get(key)
         if isinstance(val, str) and val:
-            keys.add(normalize_image_ref(val))
-            keys.add(normalize_image_ref(strip_digest(val)))
+            add_matching_keys_from_string(keys, val)
     return keys
 
 
@@ -598,7 +762,19 @@ def main() -> int:
         action="store_true",
         help="Poll each import job until completion (slower; useful for debugging).",
     )
+    parser.add_argument(
+        "--include-kube-system",
+        action="store_true",
+        help=(
+            "Include images from pods in the kube-system namespace "
+            "(default: exclude; reduces addon/MCR noise)."
+        ),
+    )
     args = parser.parse_args()
+
+    include_kube_system = args.include_kube_system or _env_truthy(
+        "INCLUDE_KUBE_SYSTEM", default=False
+    )
 
     token = os.environ.get("SNYK_TOKEN", "").strip()
     org_id = os.environ.get("SNYK_ORG_ID", "").strip()
@@ -631,8 +807,21 @@ def main() -> int:
             return 1
         subscription_ids = [s.strip() for s in sub_env.split(",") if s.strip()]
         resource_group = _env_optional("AZURE_RESOURCE_GROUP")
-        cluster_images = collect_all_images(subscription_ids, resource_group)
+        cluster_images = collect_all_images(
+            subscription_ids,
+            resource_group,
+            include_kube_system=include_kube_system,
+        )
         print(f"\nTotal: {len(cluster_images)} unique image references across all clusters.", flush=True)
+
+    n_before_dedupe = len(cluster_images)
+    cluster_images = dedupe_cluster_images_by_content(cluster_images)
+    if len(cluster_images) < n_before_dedupe:
+        print(
+            f"Deduplicated {n_before_dedupe} strings to {len(cluster_images)} "
+            "import target(s) (same digest from spec + status counts once).",
+            flush=True,
+        )
 
     if not cluster_images:
         print("No images found — nothing to reconcile.")
@@ -673,14 +862,8 @@ def main() -> int:
     # --- Reconcile ---
     missing: list[str] = []
     for img in sorted(cluster_images):
-        n = normalize_image_ref(img)
-        n_base = normalize_image_ref(strip_digest(img))
-        if n in known or n_base in known:
+        if cluster_image_matches_snyk(img, known):
             continue
-        if n.startswith("docker.io/"):
-            short = n[len("docker.io/"):]
-            if short in known or normalize_image_ref(strip_digest(short)) in known:
-                continue
         missing.append(img)
 
     if not missing:
