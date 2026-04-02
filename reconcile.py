@@ -7,7 +7,8 @@ Flow:
      environment variables, managed identity, etc. — no kubectl required).
   2. Discover all AKS clusters in the configured subscription (optionally scoped to
      a resource group) and fetch per-cluster kubeconfigs via the Azure API.
-  3. Query running pod images from each cluster (spec image + status containerStatuses image_id digests).
+  3. Query pod images from each cluster (spec image + status containerStatuses image_id digests),
+     from pods in **Running** phase only by default (avoids stale images from Succeeded/Failed Job pods).
   4. Paginate Snyk REST projects and build a set of known image refs and sha256 keys.
   5. For images not matched, POST to the Snyk v1 import API using the integration
      that matches the image registry.
@@ -29,17 +30,28 @@ Environment variables (set in .env):
   Optional scoping:
     AZURE_RESOURCE_GROUP   Limit cluster discovery to one resource group
     INCLUDE_KUBE_SYSTEM    If 1/true/yes: include pods in kube-system (default: exclude them).
+    INCLUDE_ALL_POD_PHASES If 1/true/yes: include images from pods in any phase (Succeeded, Failed,
+                           Pending, etc.). Default: only Running pods — use only if you need legacy behavior.
+    EXCLUDE_INIT_CONTAINERS If 1/true/yes: skip spec.initContainers and status.initContainerStatuses
+                            (e.g. Online Boutique loadgenerator uses busybox:latest as an init image).
 
   Optional discovery / API:
     SNYK_REST_BASE         Snyk REST API base (default: https://api.snyk.io)
     SNYK_V1_BASE           Snyk v1 API base (default: https://snyk.io)
     SNYK_REST_VERSION      REST API version (default: 2024-10-15)
+    SNYK_DEBUG             If 1/true: DEBUG logging (first project attributes, snyk_project_image_keys).
 
   Optional tagging (after each successful import job completes):
     SNYK_TAG_IMPORTED_PROJECTS  If unset or 1/true/yes: apply Snyk project tags (default on).
                                 Set to 0/false/no to skip.
     SNYK_IMPORT_TAG_KEY       Tag key (default: image)
     SNYK_IMPORT_TAG_VALUE     Tag value (default: deployed)
+
+  Cleanup (after imports): stale Snyk projects are those whose image identity does not match
+    any running workload image (refs + digests from the Kubernetes API). By default, cleanup
+    lists projects with the REST ``tags=key:value`` filter (same as SNYK_IMPORT_TAG_*) plus
+    ``expand=target``. SNYK_CLEANUP_REQUIRE_TAG  If 0/false: list all projects and match images
+    only (use with care in orgs that have other container projects).
 
 Usage:
   1. az login  (or set AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_ID for SP auth)
@@ -54,6 +66,22 @@ Include addon/system images from kube-system (default is to skip that namespace)
   python reconcile.py --include-kube-system
   # or INCLUDE_KUBE_SYSTEM=1 in .env
 
+Include images from non-Running pods (old Job pods, etc.; not recommended):
+  python reconcile.py --all-pod-phases
+  # or INCLUDE_ALL_POD_PHASES=1 in .env
+
+Omit init container images (busybox in loadgenerator init, etc.):
+  python reconcile.py --exclude-init-containers
+  # or EXCLUDE_INIT_CONTAINERS=1 in .env
+
+After imports, remove stale projects that were tagged by this tool (see cleanup in code).
+Preview deletions without calling the API:
+  python reconcile.py --dry-run
+
+Debug (Snyk REST project attributes / matching keys):
+  python reconcile.py --debug
+  # or SNYK_DEBUG=1
+
 Cron (hourly):
   0 * * * * cd /path/to/snyk-image-coverage && .venv/bin/python reconcile.py >> /var/log/snyk-reconcile.log 2>&1
 """
@@ -62,17 +90,33 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
+import logging
 import os
 import re
 import sys
 import time
 import yaml
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import requests
 from dotenv import load_dotenv
+
+# Named logger so `python reconcile.py` (__main__) still logs under a stable name.
+log = logging.getLogger("reconcile")
+
+
+def _configure_reconcile_logging(debug: bool) -> None:
+    """Attach a single handler to ``reconcile`` only — avoids enabling DEBUG on Azure SDK / urllib3."""
+    log.setLevel(logging.DEBUG if debug else logging.WARNING)
+    if log.handlers:
+        return
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    log.addHandler(h)
 from urllib3.exceptions import MaxRetryError, ProtocolError
 
 try:
@@ -99,8 +143,11 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 DEFAULT_REST_VERSION = "2024-10-15"
+# Snyk REST GET /orgs/{{org_id}}/projects rejects limit < 10.
+SNYK_REST_PROJECTS_PAGE_MIN_LIMIT = 10
 V1_IMPORT_PATH = "/api/v1/org/{org_id}/integrations/{integration_id}/import"
 V1_PROJECT_TAGS_PATH = "/api/v1/org/{org_id}/project/{project_id}/tags"
+V1_PROJECT_DELETE_PATH = "/api/v1/org/{org_id}/project/{project_id}"
 DEFAULT_IMPORT_TAG_KEY = "image"
 DEFAULT_IMPORT_TAG_VALUE = "deployed"
 KUBE_SYSTEM_NAMESPACE = "kube-system"
@@ -260,10 +307,20 @@ def collect_cluster_images(
     core_v1: k8s_client.CoreV1Api,
     *,
     include_kube_system: bool = False,
+    only_running_pods: bool = True,
+    exclude_init_containers: bool = False,
 ) -> set[str]:
     """
-    Return unique image references from all running pods: spec image strings plus
-    resolved content digests from status (containerStatuses[].image_id).
+    Return unique image references from pods: spec image strings plus resolved
+    content digests from status (containerStatuses[].image_id).
+
+    When ``only_running_pods`` is True (default), only pods with
+    ``status.phase == "Running"`` are considered. Otherwise completed or failed
+    Job/CronJob pods (and other phases) still contribute their images — which
+    often pulls in registry images that are no longer actually deployed.
+
+    When ``exclude_init_containers`` is True, init container images are omitted
+    (some demos use a minimal image like busybox only in ``initContainers``).
 
     By default, pods in the ``kube-system`` namespace are skipped to avoid
     continually importing cluster addon images. Set ``include_kube_system=True``
@@ -281,18 +338,26 @@ def collect_cluster_images(
         ns = (pod.metadata.namespace if pod.metadata else None) or ""
         if not include_kube_system and ns == KUBE_SYSTEM_NAMESPACE:
             continue
+        if only_running_pods:
+            phase = (pod.status.phase if pod.status else None) or ""
+            if phase != "Running":
+                continue
         spec = pod.spec
         if spec:
-            for container in (spec.containers or []) + (spec.init_containers or []) + (
-                spec.ephemeral_containers or []
-            ):
+            spec_containers: list = list(spec.containers or [])
+            if not exclude_init_containers:
+                spec_containers += list(spec.init_containers or [])
+            spec_containers += list(spec.ephemeral_containers or [])
+            for container in spec_containers:
                 if container.image:
                     images.add(container.image.strip())
         status = pod.status
         if status:
-            for cs in (status.container_statuses or []) + (status.init_container_statuses or []) + (
-                status.ephemeral_container_statuses or []
-            ):
+            statuses: list = list(status.container_statuses or [])
+            if not exclude_init_containers:
+                statuses += list(status.init_container_statuses or [])
+            statuses += list(status.ephemeral_container_statuses or [])
+            for cs in statuses:
                 if cs.image_id:
                     images.add(strip_docker_pullable_prefix(cs.image_id))
     return images
@@ -303,10 +368,12 @@ def collect_all_images(
     resource_group: str | None = None,
     *,
     include_kube_system: bool = False,
+    only_running_pods: bool = True,
+    exclude_init_containers: bool = False,
 ) -> set[str]:
     """
     Discover all AKS clusters across the given subscriptions and collect
-    running image references from each one.
+    image references from each one (see ``collect_cluster_images``).
     """
     all_images: set[str] = set()
 
@@ -330,10 +397,25 @@ def collect_all_images(
                     "use --include-kube-system or INCLUDE_KUBE_SYSTEM=1 to include)",
                     flush=True,
                 )
+            if only_running_pods:
+                print(
+                    "    (only pods with phase Running; "
+                    "--all-pod-phases or INCLUDE_ALL_POD_PHASES=1 for all phases)",
+                    flush=True,
+                )
+            if exclude_init_containers:
+                print(
+                    "    (excluding initContainer images; "
+                    "--exclude-init-containers / EXCLUDE_INIT_CONTAINERS=1)",
+                    flush=True,
+                )
             try:
                 core_v1 = make_k8s_core_v1(sub, rg, name)
                 images = collect_cluster_images(
-                    core_v1, include_kube_system=include_kube_system
+                    core_v1,
+                    include_kube_system=include_kube_system,
+                    only_running_pods=only_running_pods,
+                    exclude_init_containers=exclude_init_containers,
                 )
                 print(f"    {len(images)} unique image references found.")
                 all_images.update(images)
@@ -513,6 +595,13 @@ def dedupe_cluster_images_by_content(refs: set[str]) -> set[str]:
 def snyk_project_image_keys(project: dict) -> set[str]:
     keys: set[str] = set()
     attrs = project.get("attributes") or {}
+    log.debug(
+        "project %s: attrs keys=%s name=%r (n=%d)",
+        project.get("id"),
+        list(attrs.keys()),
+        attrs.get("name"),
+        len(attrs),
+    )
     name = attrs.get("name")
     if isinstance(name, str) and name:
         add_matching_keys_from_string(keys, name)
@@ -528,10 +617,29 @@ def iter_snyk_projects(
     rest_base: str,
     org_id: str,
     version: str,
+    tags: list[str] | None = None,
+    expand: list[str] | None = None,
 ) -> Iterable[dict]:
+    """
+    Paginate org projects. Optional ``tags`` REST filter uses ``key:value`` strings
+    (projects must match all listed tags).
+
+    Pass ``expand=[\"target\"]`` so each project includes ``relationships.target.data.id``
+    (the list response often omits target linkage without it).
+    """
     base = rest_base.rstrip("/")
     url = f"{base}/rest/orgs/{org_id}/projects"
-    params: dict | None = {"version": version, "limit": 100}
+    params_list: list[tuple[str, str | int]] = [
+        ("version", version),
+        ("limit", 100),
+    ]
+    if tags:
+        for t in tags:
+            params_list.append(("tags", t))
+    if expand:
+        for e in expand:
+            params_list.append(("expand", e))
+    params: list[tuple[str, str | int]] | None = params_list
 
     while url:
         r = session.get(url, params=params)
@@ -554,12 +662,16 @@ def is_likely_container_project(project: dict) -> bool:
         pt = meta.get("project_type") or (project.get("attributes") or {}).get("type")
         if pt is None:
             return True
-        if isinstance(pt, str) and "container" in pt.lower():
-            return True
+        if isinstance(pt, str):
+            pl = pt.lower()
+            # Snyk often uses project_type "linux" for container image scans.
+            if pl == "linux" or "container" in pl:
+                return True
         if pt in ("dockerfile", "helm", "kubernetes"):
             return True
+        # apk/deb are OS layers inside container image scans (e.g. redis:alpine → apk).
         if pt in ("apk", "deb"):
-            return False
+            return True
         return "docker" in str(pt).lower() or "container" in str(pt).lower()
     return True
 
@@ -658,6 +770,352 @@ def add_project_tags(
             continue
         return False, r.text or r.reason
     return True, ""
+
+
+def delete_project_v1(
+    session: requests.Session,
+    v1_base: str,
+    org_id: str,
+    project_id: str,
+) -> tuple[bool, str]:
+    url = f"{v1_base.rstrip('/')}" + V1_PROJECT_DELETE_PATH.format(
+        org_id=org_id, project_id=project_id
+    )
+    r = session.delete(url)
+    if r.status_code in (200, 204):
+        return True, ""
+    return False, r.text or r.reason
+
+
+def get_project_target_id(project: dict) -> str | None:
+    """Return ``relationships.target.data.id`` from a REST project resource (JSON:API)."""
+    rel = (project.get("relationships") or {}).get("target") or {}
+    data = rel.get("data")
+    if not isinstance(data, dict):
+        return None
+    tid = data.get("id")
+    return tid if isinstance(tid, str) and tid else None
+
+
+def _log_resolve_target_relationships_debug(
+    project_id: str | None,
+    label: str,
+    list_project: dict,
+    full_project: dict | None,
+) -> None:
+    """Emit raw ``relationships`` from list and/or GET payloads when target id cannot be resolved."""
+    try:
+        list_rel = json.dumps(list_project.get("relationships"), sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        list_rel = repr(list_project.get("relationships"))
+    if full_project is not None:
+        try:
+            get_rel = json.dumps(full_project.get("relationships"), sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            get_rel = repr(full_project.get("relationships"))
+        print(
+            f"  debug: resolve_project_target_id project_id={project_id!r} ({label}) "
+            f"relationships[list]={list_rel} relationships[get]={get_rel}",
+            flush=True,
+        )
+    else:
+        print(
+            f"  debug: resolve_project_target_id project_id={project_id!r} ({label}) "
+            f"relationships[list]={list_rel}",
+            flush=True,
+        )
+
+
+def fetch_project_rest(
+    session: requests.Session,
+    rest_base: str,
+    org_id: str,
+    version: str,
+    project_id: str,
+    *,
+    expand: list[str] | None = None,
+) -> dict | None:
+    """GET ``/rest/orgs/{{org_id}}/projects/{{project_id}}``; return the JSON:API resource object."""
+    base = rest_base.rstrip("/")
+    url = f"{base}/rest/orgs/{org_id}/projects/{project_id}"
+    params: list[tuple[str, str]] = [("version", version)]
+    if expand:
+        for e in expand:
+            params.append(("expand", e))
+    r = session.get(url, params=params)
+    r.raise_for_status()
+    payload = r.json()
+    data = payload.get("data")
+    return data if isinstance(data, dict) else None
+
+
+def resolve_project_target_id(
+    session: requests.Session,
+    rest_base: str,
+    org_id: str,
+    version: str,
+    project: dict,
+) -> str | None:
+    """
+    Target id for orphan cleanup: prefer embedded relationship, else GET project with
+    ``expand=target`` (list responses often omit ``relationships.target.data``).
+    """
+    pid = project.get("id")
+    if not isinstance(pid, str) or not pid:
+        _log_resolve_target_relationships_debug(
+            None, "missing_project_id", project, None
+        )
+        return None
+
+    tid = get_project_target_id(project)
+    if tid:
+        return tid
+
+    try:
+        full = fetch_project_rest(
+            session, rest_base, org_id, version, pid, expand=["target"]
+        )
+    except requests.HTTPError as e:
+        _log_resolve_target_relationships_debug(
+            pid, f"fetch_project_http_error:{e}", project, None
+        )
+        return None
+    except requests.RequestException as e:
+        _log_resolve_target_relationships_debug(
+            pid, f"fetch_project_error:{e}", project, None
+        )
+        return None
+
+    tid = get_project_target_id(full) if full else None
+    if tid:
+        return tid
+
+    _log_resolve_target_relationships_debug(
+        pid, "no_target_id_after_embed_and_get", project, full
+    )
+    return None
+
+
+def target_has_remaining_projects(
+    session: requests.Session,
+    rest_base: str,
+    org_id: str,
+    version: str,
+    target_id: str,
+) -> bool:
+    """
+    ``GET /rest/orgs/{{org_id}}/projects?target_id={{targetId}}&limit={{min}}``.
+
+    Uses ``limit >= SNYK_REST_PROJECTS_PAGE_MIN_LIMIT`` (Snyk returns 400 if lower).
+    Returns True if any project remains for that target.
+    """
+    base = rest_base.rstrip("/")
+    url = f"{base}/rest/orgs/{org_id}/projects"
+    r = session.get(
+        url,
+        params={
+            "version": version,
+            "limit": SNYK_REST_PROJECTS_PAGE_MIN_LIMIT,
+            "target_id": [target_id],
+        },
+    )
+    r.raise_for_status()
+    payload = r.json()
+    data = payload.get("data") or []
+    return len(data) > 0
+
+
+def delete_target_rest(
+    session: requests.Session,
+    rest_base: str,
+    org_id: str,
+    target_id: str,
+    version: str,
+) -> tuple[bool, str]:
+    """``DELETE /rest/orgs/{{org_id}}/targets/{{targetId}}?version=...`` → expect 204."""
+    base = rest_base.rstrip("/")
+    url = f"{base}/rest/orgs/{org_id}/targets/{target_id}"
+    r = session.delete(url, params={"version": version})
+    if r.status_code == 204:
+        return True, ""
+    return False, r.text or r.reason
+
+
+def project_matches_any_cluster_image(project: dict, cluster_images: set[str]) -> bool:
+    proj_keys = snyk_project_image_keys(project)
+    if not proj_keys:
+        return False
+    for c in cluster_images:
+        if cluster_image_matches_snyk(c, proj_keys):
+            return True
+    return False
+
+
+def cleanup_stale_deployed_projects(
+    rest_session: requests.Session,
+    v1_session: requests.Session,
+    rest_base: str,
+    v1_base: str,
+    org_id: str,
+    rest_version: str,
+    cluster_images: set[str],
+    tag_key: str,
+    tag_value: str,
+    *,
+    dry_run: bool,
+    require_tag: bool = True,
+) -> int:
+    """
+    Remove container projects that **no longer match any** image string in ``cluster_images``
+    (pod ``spec.image`` and ``status.image_id`` digests — i.e. what is actually running).
+
+    When ``require_tag`` is True (default), the project list uses the REST ``tags`` query
+    filter (``key:value``) so the server returns only matching projects; the
+    ``is_likely_container_project`` check is skipped (tag scope is enough; avoids dropping
+    deb/apk-typed linux base images). When ``require_tag=False``, type filtering applies.
+    Set ``require_tag=False`` to list all projects and match on image identity only (no tag gate).
+
+    After each **successful** v1 project delete, resolves the owning REST target from
+    the **pre-delete** project body: ``relationships.target.data.id``. When all stale
+    projects for that target are removed without error, calls
+    ``GET /rest/orgs/{{orgId}}/projects?target_id={{id}}&limit=10``; if the page has
+    no projects, calls ``DELETE /rest/orgs/{{orgId}}/targets/{{targetId}}``. Fully
+    automatic (no manual steps).
+
+    Returns the number of failed delete or follow-up operations (0 when ``dry_run``).
+    """
+    if require_tag and (not tag_key.strip() or not tag_value.strip()):
+        print("Cleanup skipped: empty SNYK_IMPORT_TAG_KEY or SNYK_IMPORT_TAG_VALUE.", flush=True)
+        return 0
+
+    tag_token: str | None = None
+    if require_tag:
+        tag_token = f"{tag_key.strip()}:{tag_value.strip()}"
+        print(
+            f"\nCleanup: listing projects with REST tags={tag_token!r} and expand=target "
+            f"({'dry-run; no deletes' if dry_run else 'stale projects will be deleted'})...",
+            flush=True,
+        )
+    else:
+        print(
+            f"\nCleanup: scanning container projects (image match only; no tag filter — "
+            f"{'dry-run; no deletes' if dry_run else 'stale projects will be deleted'})...",
+            flush=True,
+        )
+
+    stale: list[tuple[str, dict]] = []
+    try:
+        for proj in iter_snyk_projects(
+            rest_session,
+            rest_base,
+            org_id,
+            rest_version,
+            tags=[tag_token] if require_tag and tag_token else None,
+            expand=["target"],
+        ):
+            # When require_tag=True, REST tags= scopes to script-managed projects;
+            # skip project_type filtering (deb/apk linux base layers are still containers).
+            if not require_tag and not is_likely_container_project(proj):
+                continue
+            if project_matches_any_cluster_image(proj, cluster_images):
+                continue
+            pid = proj.get("id")
+            if not isinstance(pid, str) or not pid:
+                continue
+            stale.append((pid, proj))
+    except requests.HTTPError as e:
+        detail = f" Body: {e.response.text[:500]}" if e.response is not None else ""
+        print(f"Cleanup: Snyk REST list failed: {e}.{detail}", file=sys.stderr)
+        return 1
+    except requests.RequestException as e:
+        print(f"Cleanup: Snyk REST unreachable: {e}", file=sys.stderr)
+        return 1
+
+    if not stale:
+        print(
+            "Cleanup: no stale projects (all container projects in scope match the cluster image set).",
+            flush=True,
+        )
+        return 0
+
+    by_target: dict[str | None, list[tuple[str, dict]]] = defaultdict(list)
+    for pid, proj in stale:
+        tid = resolve_project_target_id(
+            rest_session, rest_base, org_id, rest_version, proj
+        )
+        by_target[tid].append((pid, proj))
+
+    print(f"Cleanup: {len(stale)} project(s) no longer match the cluster image set:", flush=True)
+    failures = 0
+    for target_id, entries in by_target.items():
+        batch_failures = 0
+        for pid, proj in entries:
+            attrs = proj.get("attributes") or {}
+            name = attrs.get("name") or pid
+            if dry_run:
+                tid_label = target_id or "(no target)"
+                print(
+                    f"  [dry-run] would DELETE project {pid} ({name!r}) "
+                    f"[target {tid_label}]",
+                    flush=True,
+                )
+                continue
+            ok, err = delete_project_v1(v1_session, v1_base, org_id, pid)
+            if ok:
+                print(f"  deleted project {pid} ({name!r})", flush=True)
+            else:
+                print(f"  delete failed for {pid} ({name!r}): {err[:500]}", file=sys.stderr)
+                batch_failures += 1
+                failures += 1
+
+        if dry_run:
+            if target_id:
+                print(
+                    f"  [dry-run] would DELETE target {target_id} via REST if no projects remain",
+                    flush=True,
+                )
+            continue
+
+        # Orphan target removal: target_id comes from each project's relationships.target.data.id
+        # (captured before v1 DELETE). Re-check with REST list; delete target only if count is zero.
+        if target_id and batch_failures == 0:
+            try:
+                if target_has_remaining_projects(
+                    rest_session, rest_base, org_id, rest_version, target_id
+                ):
+                    print(
+                        f"  target {target_id} still has other project(s); not removing target",
+                        flush=True,
+                    )
+                    continue
+            except requests.HTTPError as e:
+                detail = f" Body: {e.response.text[:500]}" if e.response is not None else ""
+                print(
+                    f"  could not list projects for target {target_id}: {e}{detail}",
+                    file=sys.stderr,
+                )
+                failures += 1
+                continue
+            except requests.RequestException as e:
+                print(f"  could not list projects for target {target_id}: {e}", file=sys.stderr)
+                failures += 1
+                continue
+            tok, terr = delete_target_rest(
+                rest_session, rest_base, org_id, target_id, rest_version
+            )
+            if tok:
+                print(f"  deleted target {target_id} (no remaining projects)", flush=True)
+            else:
+                print(f"  delete target failed for {target_id}: {terr[:500]}", file=sys.stderr)
+                failures += 1
+        elif not target_id and batch_failures == 0:
+            print(
+                "  warning: could not resolve REST target id for this group; "
+                "skipping DELETE /targets (orphan target may remain).",
+                flush=True,
+            )
+
+    return failures
 
 
 def tag_projects_from_import_job(
@@ -770,10 +1228,50 @@ def main() -> int:
             "(default: exclude; reduces addon/MCR noise)."
         ),
     )
+    parser.add_argument(
+        "--all-pod-phases",
+        action="store_true",
+        help=(
+            "Include images from pods in any phase (Succeeded, Failed, Pending, etc.). "
+            "Default: only Running pods, so completed Job/CronJob pods do not pollute the image set."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-init-containers",
+        action="store_true",
+        help=(
+            "Do not collect images from initContainers (only main + ephemeral containers). "
+            "Useful when workloads use busybox solely as an init helper."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Log stale tagged projects that would be deleted after import; "
+            "do not call the delete API."
+        ),
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable DEBUG logging (first project attributes, per-project snyk_project_image_keys).",
+    )
     args = parser.parse_args()
+
+    _configure_reconcile_logging(
+        args.debug or _env_truthy("SNYK_DEBUG", default=False)
+    )
 
     include_kube_system = args.include_kube_system or _env_truthy(
         "INCLUDE_KUBE_SYSTEM", default=False
+    )
+    include_all_phases = args.all_pod_phases or _env_truthy(
+        "INCLUDE_ALL_POD_PHASES", default=False
+    )
+    only_running_pods = not include_all_phases
+    exclude_init_containers = args.exclude_init_containers or _env_truthy(
+        "EXCLUDE_INIT_CONTAINERS", default=False
     )
 
     token = os.environ.get("SNYK_TOKEN", "").strip()
@@ -793,6 +1291,7 @@ def main() -> int:
     tag_pairs: list[tuple[str, str]] = (
         [(tag_key, tag_value)] if tag_imported and tag_key and tag_value else []
     )
+    cleanup_require_tag = _env_truthy("SNYK_CLEANUP_REQUIRE_TAG", default=True)
 
     # --- Collect images ---
     if args.images_file:
@@ -811,11 +1310,14 @@ def main() -> int:
             subscription_ids,
             resource_group,
             include_kube_system=include_kube_system,
+            only_running_pods=only_running_pods,
+            exclude_init_containers=exclude_init_containers,
         )
         print(f"\nTotal: {len(cluster_images)} unique image references across all clusters.", flush=True)
 
-    n_before_dedupe = len(cluster_images)
-    cluster_images = dedupe_cluster_images_by_content(cluster_images)
+    cluster_refs_raw: set[str] = set(cluster_images)
+    n_before_dedupe = len(cluster_refs_raw)
+    cluster_images = dedupe_cluster_images_by_content(cluster_refs_raw)
     if len(cluster_images) < n_before_dedupe:
         print(
             f"Deduplicated {n_before_dedupe} strings to {len(cluster_images)} "
@@ -843,9 +1345,13 @@ def main() -> int:
     print("\nFetching Snyk projects...", flush=True)
     known: set[str] = set()
     project_count = 0
+    first_project_logged = False
     try:
         for proj in iter_snyk_projects(rest_session, rest_base, org_id, rest_version):
             project_count += 1
+            if not first_project_logged:
+                first_project_logged = True
+                log.debug("First project full attributes: %s", proj.get("attributes"))
             if not is_likely_container_project(proj):
                 continue
             known.update(snyk_project_image_keys(proj))
@@ -866,44 +1372,57 @@ def main() -> int:
             continue
         missing.append(img)
 
+    failures = 0
     if not missing:
         print("All cluster images appear to have a matching Snyk project.")
-        return 0
+    else:
+        print(f"\n{len(missing)} images not matched; importing:")
+        for m in missing:
+            print(f"  - {m}")
+        if tag_pairs:
+            print(
+                f"\nAfter each import completes, projects get tag "
+                f"{tag_key}={tag_value} "
+                f"(override with SNYK_IMPORT_TAG_*; disable with SNYK_TAG_IMPORTED_PROJECTS=0).",
+                flush=True,
+            )
 
-    print(f"\n{len(missing)} images not matched; importing:")
-    for m in missing:
-        print(f"  - {m}")
-    if tag_pairs:
-        print(
-            f"\nAfter each import completes, projects get tag "
-            f"{tag_key}={tag_value} "
-            f"(override with SNYK_IMPORT_TAG_*; disable with SNYK_TAG_IMPORTED_PROJECTS=0).",
-            flush=True,
-        )
-
-    failures = 0
-    for img in missing:
-        iid = integration_id_for_image(img, routing)
-        ok, detail = import_image_v1(v1_session, v1_base, org_id, iid, img)
-        if not ok:
-            print(f"Import failed: {img} -> {detail}", file=sys.stderr)
-            failures += 1
-            continue
-        print(f"Import started: {img} -> {detail}")
-        poll_for_job = bool(detail) and (args.wait_import or bool(tag_pairs))
-        if poll_for_job and detail:
-            try:
-                final = poll_import_job(v1_session, detail)
-            except Exception as e:
-                print(f"  import job poll failed ({img}): {e}", file=sys.stderr)
+        for img in missing:
+            iid = integration_id_for_image(img, routing)
+            ok, detail = import_image_v1(v1_session, v1_base, org_id, iid, img)
+            if not ok:
+                print(f"Import failed: {img} -> {detail}", file=sys.stderr)
                 failures += 1
                 continue
-            if args.wait_import:
-                print(f"  job status: {final.get('status')} {final.get('error', '')}")
-            if tag_pairs:
-                failures += tag_projects_from_import_job(
-                    v1_session, v1_base, org_id, final, tag_pairs, context=img
-                )
+            print(f"Import started: {img} -> {detail}")
+            poll_for_job = bool(detail) and (args.wait_import or bool(tag_pairs))
+            if poll_for_job and detail:
+                try:
+                    final = poll_import_job(v1_session, detail)
+                except Exception as e:
+                    print(f"  import job poll failed ({img}): {e}", file=sys.stderr)
+                    failures += 1
+                    continue
+                if args.wait_import:
+                    print(f"  job status: {final.get('status')} {final.get('error', '')}")
+                if tag_pairs:
+                    failures += tag_projects_from_import_job(
+                        v1_session, v1_base, org_id, final, tag_pairs, context=img
+                    )
+
+    failures += cleanup_stale_deployed_projects(
+        rest_session,
+        v1_session,
+        rest_base,
+        v1_base,
+        org_id,
+        rest_version,
+        cluster_refs_raw,
+        tag_key,
+        tag_value,
+        dry_run=args.dry_run,
+        require_tag=cleanup_require_tag,
+    )
 
     return 1 if failures else 0
 
