@@ -1,4 +1,4 @@
-# snyk-image-coverage
+# snyk-deployed-image-coverage
 
 Automatically reconcile container images running in your AKS clusters with Snyk container projects. Import images that are deployed but not yet scanned, tag them so you can find them later, and clean up Snyk projects for images that are no longer running — all without kubectl or a local kubeconfig.
 
