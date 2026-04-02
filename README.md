@@ -1,141 +1,153 @@
 # snyk-image-coverage
 
-## Purpose
+Automatically reconcile container images running in your AKS clusters with Snyk container projects. Import images that are deployed but not yet scanned, tag them so you can find them later, and clean up Snyk projects for images that are no longer running — all without kubectl or a local kubeconfig.
 
-This script helps you **close the gap between what is actually running in your cluster and what Snyk already tracks**. It discovers **container images deployed on your AKS workloads** (every distinct image reference from running pods), compares them to your Snyk org’s **container projects**, and for anything **not yet represented in Snyk** it calls Snyk’s **import API**. Each import queues Snyk to pull and scan that image via the **registry integration** you configured (ACR, MCR, ECR, Docker Hub, etc.). The goal is **coverage**: workloads on the cluster get corresponding container projects in Snyk without manually importing image by image.
+---
 
-## Matching cluster images to Snyk
+## Why this exists
 
-When you import a container image, Snyk’s model is **digest-centric**: the scan is tied to the immutable layer identity you get from the registry (the same digest Kubernetes resolves when it pulls the image). The REST API exposes that in places like project **attributes** (e.g. `imageId` / `image_id`, target reference fields) and via **Container image** endpoints (`/rest/orgs/{org_id}/container_images`, …), which are keyed by Snyk’s own image identifiers.
+When customers talk about container scanning with Snyk, the ask is almost always the same: *scan what's actually deployed, not everything in the registry.* Snyk has no native way to determine which scanned images are actively running on your clusters. This script closes that gap.
 
-**Yes — matching on that identity (ultimately the digest) is the right long-term approach** and avoids fragile “same tag string” comparisons.
+On each run it:
 
-This script’s implementation is still **mostly string-heuristic** on the **Projects** list: it normalizes full image strings and compares them to project names plus a handful of attribute values copied into a single `known` set (including `imageId` where the API returns it). It does **not** yet:
+1. Discovers all AKS clusters in your Azure subscription(s) using the Azure SDK (no kubectl required).
+2. Collects every image reference from running pods — both the `spec` tag string and the resolved `sha256` digest from `status.containerStatuses[].image_id`.
+3. Pages through your Snyk org's projects and builds a set of known image refs and digests.
+4. Imports any cluster image that doesn't already have a Snyk project, routing to the right registry integration by hostname.
+5. Tags newly imported projects `image=deployed` (configurable) so you can filter in the Snyk UI.
+6. Deletes Snyk projects tagged `image=deployed` whose image is no longer running, then removes the orphaned Snyk target if no projects remain.
 
-- Treat **`sha256:…` as a first-class join key** on both sides (for example, if the workload string is `registry/app@sha256:abc…` but Snyk’s stored fields surface only digest-shaped values, the script does not reliably declare a match unless those strings happen to coincide after normalization).
-
-- Pull **resolved** image identities from pod **status** (e.g. `containerStatuses[].imageID`), only the **spec** `image` strings. So pods that specify `image: myrepo/app:1.2` while the node is running digest `sha256:…` may not contribute a digest on the cluster side for the script to compare — even though Snyk may only “look like” digest + repo in the UI/API.
-
-So mismatches remain possible (digest-only spec, tag-only spec, multi-arch digest variance, or API field shapes that do not land in the attributes this script reads). **Tighter matching** would mean extending `reconcile.py`: collect runtime image IDs (and/or canonical digests) from the cluster, normalize digests from Snyk project/container-image responses, and reconcile on **digest equality** (with a tag/name fallback if you still want it).
-
-## How it works
-
-1. **Azure** — Uses [DefaultAzureCredential](https://learn.microsoft.com/en-us/python/api/azure-identity/azure.identity.defaultazurecredential) (`az login`, service principal, managed identity, etc.) against the subscription(s) in `AZURE_SUBSCRIPTION_ID`, optionally limited by `AZURE_RESOURCE_GROUP`.
-2. **Discover clusters** — Lists AKS managed clusters in those subscriptions via the Azure Resource Manager API.
-3. **Cluster API access** — For each cluster, obtains a short-lived **kubeconfig** from Azure (`list_cluster_user_credentials`); no kubeconfig files or cluster admin kubeconfig on disk are required.
-4. **List running images** — Uses the Kubernetes Python client to **list pods in all namespaces** and collects images from regular containers, init containers, and ephemeral containers.
-5. **Snyk inventory** — Paginates your org’s projects from the **Snyk REST API** and derives normalized keys from project names and container-related attributes.
-6. **Reconcile** — Any cluster image that does not match the known set is treated as missing; the script **POSTs** to Snyk’s **v1 import** endpoint with the appropriate **integration ID** (from `SNYK_INTEGRATION_ID` or per-registry overrides like `SNYK_INTEGRATION_ID_ACR`). The request strips the registry hostname from the image ref where Snyk expects only the repository path for that integration.
-7. **Tag imported projects (default)** — For each import, the script **polls the import job** until it finishes, reads the created **project id(s)** from the job payload, and **POSTs** Snyk **project tags** (v1 API: `.../project/{projectId}/tags`). By default it applies **`image` = `deployed`** so you can filter reports on *deployed* workload images. Disable or override with `SNYK_TAG_IMPORTED_PROJECTS` and `SNYK_IMPORT_TAG_KEY` / `SNYK_IMPORT_TAG_VALUE` (see configuration).
-
-If you cannot or do not want to talk to Azure for a given run, you can pass **`--images-file`** with one image reference per line; the same reconcile and import steps run against that static list.
+---
 
 ## Prerequisites
 
 - Python 3.10+
-- Azure access to the subscription(s) that host AKS: `az login` (or environment variables / managed identity for service principals and automation)
-- **Azure RBAC** that can list managed clusters and fetch user credentials (for example **Azure Kubernetes Service Cluster User Role** on the cluster or subscription)
-- A Snyk org with **registry integration(s)** and a **Snyk API token**
+- An Azure subscription with at least one AKS cluster
+- `az login` (or a service principal via env vars — see [Auth](#auth))
+- Your identity needs **Azure Kubernetes Service Cluster User Role** on each cluster
+- A Snyk org with at least one container registry integration configured
 
-**Integration IDs are per org.** After changing `SNYK_ORG_ID`, set `SNYK_INTEGRATION_ID` (and any `SNYK_INTEGRATION_ID_*` overrides) to integrations that exist in that org. You can list v1 integration keys with:
-
-`GET https://api.snyk.io/v1/org/<SNYK_ORG_ID>/integrations` (Bearer-style: `Authorization: token <SNYK_TOKEN>`).
+---
 
 ## Setup
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+git clone https://github.com/pwalsh-snyk/snyk-image-coverage
+cd snyk-image-coverage
 pip install -r requirements.txt
+cp .env.example .env   # then fill in your values
 ```
 
-Edit `.env` in the repo root with your values (see [Configuration](#configuration)). Once it contains secrets, do not commit or push `.env`—keep those changes local only.
+### .env
 
-### Azure sign-in
+```dotenv
+# Required
+SNYK_TOKEN=your-snyk-api-token
+SNYK_ORG_ID=your-snyk-org-uuid
+SNYK_INTEGRATION_ID=your-default-integration-uuid   # ACR recommended as default
+AZURE_SUBSCRIPTION_ID=your-azure-subscription-id    # comma-separated for multiple
 
-```bash
-az login
-az account set --subscription <subscription-id>   # optional if you have many subscriptions
+# Optional: route different registries to separate Snyk integrations
+SNYK_INTEGRATION_ID_ACR=        # Azure Container Registry
+SNYK_INTEGRATION_ID_GCP=        # Google Artifact Registry / GCR
+SNYK_INTEGRATION_ID_ECR=        # AWS ECR
+SNYK_INTEGRATION_ID_MCR=        # Microsoft Container Registry
+SNYK_INTEGRATION_ID_DOCKER_HUB= # Docker Hub
+
+# Optional: scope discovery
+AZURE_RESOURCE_GROUP=           # limit to one resource group
+
+# Optional: tagging (defaults shown)
+SNYK_IMPORT_TAG_KEY=image
+SNYK_IMPORT_TAG_VALUE=deployed
+SNYK_TAG_IMPORTED_PROJECTS=1    # set to 0 to skip tagging
+
+# Optional: cleanup
+SNYK_CLEANUP_REQUIRE_TAG=1      # set to 0 to match all container projects, not just tagged ones
 ```
 
-The script reads `AZURE_SUBSCRIPTION_ID` from `.env` (comma-separated for multiple subscriptions).
-
-## Configuration
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `SNYK_TOKEN` | Yes | Snyk API token |
-| `SNYK_ORG_ID` | Yes | Organization ID (Snyk UI → Organization settings) |
-| `SNYK_INTEGRATION_ID` | Yes | Default container registry integration ID (often ACR) |
-| `AZURE_SUBSCRIPTION_ID` | Yes* | Subscription UUID(s) to scan; comma-separated for multiple |
-| `AZURE_RESOURCE_GROUP` | No | If set, only clusters in this resource |
-| `SNYK_INTEGRATION_ID_ACR` | No | `*.azurecr.io` |
-| `SNYK_INTEGRATION_ID_GCP` | No | Artifact Registry / GCR |
-| `SNYK_INTEGRATION_ID_ECR` | No | ECR |
-| `SNYK_INTEGRATION_ID_MCR` | No | `mcr.microsoft.com` |
-| `SNYK_INTEGRATION_ID_DOCKER_HUB` | No | Docker Hub / implicit `library/...` |
-| `SNYK_REST_BASE` | No | Default `https://api.snyk.io` |
-| `SNYK_V1_BASE` | No | v1 import + project-tags host; default `https://snyk.io` (imports may redirect to `app.snyk.io`) |
-| `SNYK_REST_VERSION` | No | Default `2024-10-15` |
-| `SNYK_TAG_IMPORTED_PROJECTS` | No | If `1`/`true`/unset: tag new projects after import (default). Set `0`/`false`/`no` to skip. |
-| `SNYK_IMPORT_TAG_KEY` | No | Project tag **key** (default `image`) |
-| `SNYK_IMPORT_TAG_VALUE` | No | Project tag **value** (default `deployed`) |
-
-\*Not required when using `--images-file` only (no cluster discovery).
-
-`python-dotenv` loads `.env` next to `reconcile.py`, then optional overrides from a `.env` in the current working directory.
+---
 
 ## Usage
 
 ```bash
+# Standard run: discover clusters, import missing images, clean up stale projects
 python reconcile.py
-```
 
-**Static image list** (skips Azure discovery; path must resolve under this repo or your current working directory):
+# Preview deletions without calling the Snyk delete API
+python reconcile.py --dry-run
 
-```bash
-python reconcile.py --images-file cluster-images.txt
-```
+# Include cluster addon images from kube-system (excluded by default)
+python reconcile.py --include-kube-system
 
-See `cluster-images.example.txt` for the line-oriented file format.
+# Include images from completed/failed Job pods (not recommended — pulls in stale images)
+python reconcile.py --all-pod-phases
 
-**Wait for each import job** (slower; debugging):
+# Skip init container images (useful when workloads use busybox only as an init helper)
+python reconcile.py --exclude-init-containers
 
-```bash
+# Test against a static list of image refs instead of querying Azure
+python reconcile.py --images-file images.txt
+
+# Show debug output: first project attributes, per-project key extraction
+python reconcile.py --debug
+
+# Wait for each import job to finish before moving on (slower; useful for debugging)
 python reconcile.py --wait-import
 ```
 
-Exit code `0` means success or nothing to do; non-zero indicates missing configuration, unreachable Azure/Kubernetes/Snyk, or import failures.
+---
 
-### Troubleshooting
+## Auth
 
-- **Cluster listing or kubeconfig errors** — Confirm subscription ID and RBAC. ARM resource IDs from Azure may use mixed casing (`/resourceGroups/` vs `/resourcegroups/`); the script normalizes that when resolving the resource group.
-- **`org source not found` on import** — `SNYK_INTEGRATION_ID` does not belong to `SNYK_ORG_ID`, or the integration type cannot serve that registry. Fix the org/integration pairing or add `SNYK_INTEGRATION_ID_MCR` (and similar) for multi-registry clusters.
-- **Addon images (`mcr.microsoft.com/...`)** — Use an integration that can pull from MCR, or skip system images via a filtered `--images-file` workflow.
-- **Snyk REST shows 0 projects** — Normal for an empty org; first run imports everything that does not match.
-- **`CERTIFICATE_VERIFY_FAILED` to `api.snyk.io`** — Common on some macOS Python installs. Try `export SSL_CERT_FILE=$(python -c "import certifi; print(certifi.where())")` after `pip install certifi`.
-- **Tagging: “could not find project ids in import job”** — Snyk may return a different job JSON shape than this script parses, or the job failed before projects were created. Use `python reconcile.py --wait-import` once and inspect the job response; open an issue with a redacted sample if it persists.
+The script uses `DefaultAzureCredential`, which tries credential sources in this order:
 
-## Scheduling
+1. `az login` — recommended for local development
+2. Environment variables (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`) — for service principals in CI
+3. Managed identity — for running on Azure VMs or AKS itself
 
-Example hourly cron:
+No kubeconfig or kubectl installation needed. The script fetches per-cluster credentials directly from the Azure API.
+
+---
+
+## How image matching works
+
+Each cluster image goes through two representations:
+
+- **Spec ref** — what's in `pod.spec.containers[].image`, e.g. `myregistry.azurecr.io/app:v1.2.3`
+- **Digest ref** — what's in `pod.status.containerStatuses[].image_id`, e.g. `myregistry.azurecr.io/app@sha256:abc123...`
+
+Both are normalized (lowercase, whitespace stripped, `docker-pullable://` prefix removed) before comparison against Snyk project names. If a `sha256` digest appears in either side of the comparison, it's used directly — so a tag bump that points to the same underlying image won't trigger a re-import.
+
+When a spec ref and a digest ref refer to the same content (matched via repo path + digest), they're deduplicated to a single import target.
+
+---
+
+## Cleanup behavior
+
+After imports, the script looks for Snyk projects tagged `image=deployed` (or whatever `SNYK_IMPORT_TAG_*` is set to) that don't match any currently running image. Those projects are deleted. If deleting a project leaves the owning Snyk target with zero remaining projects, the target is deleted too — so the Snyk UI stays clean without manual intervention.
+
+Set `SNYK_CLEANUP_REQUIRE_TAG=0` to instead scan all container projects in the org regardless of tag. Use with care in shared orgs.
+
+---
+
+## Running on a schedule
 
 ```cron
-0 * * * * cd /path/to/snyk-image-coverage && /path/to/.venv/bin/python reconcile.py >> /var/log/snyk-reconcile.log 2>&1
+0 * * * * cd /path/to/snyk-image-coverage && .venv/bin/python reconcile.py >> /var/log/snyk-reconcile.log 2>&1
 ```
 
-For automation, prefer a **service principal** or **managed identity** and set the Azure environment variables consumed by `DefaultAzureCredential`, instead of interactive `az login`.
+For production use, a service principal with scoped permissions is recommended over `az login`.
 
-## Dependencies
+---
 
-- [azure-identity](https://github.com/Azure/azure-sdk-for-python/tree/main/sdk/identity/azure-identity) — Azure authentication
-- [azure-mgmt-containerservice](https://github.com/Azure/azure-sdk-for-python/tree/main/sdk/containerservice/azure-mgmt-containerservice) — list clusters and user kubeconfig
-- [PyYAML](https://pyyaml.org/) — parse kubeconfig from Azure
-- [kubernetes](https://github.com/kubernetes-client/python) — list pods and container images
-- [requests](https://requests.readthedocs.io/) — Snyk HTTP APIs
-- [python-dotenv](https://github.com/theskumar/python-dotenv) — load `.env`
+## Requirements
 
-## Security notes
-
-- Keep `.env` out of version control (it is listed in `.gitignore`).
-- Treat `SNYK_TOKEN` and Azure credentials as secrets; use least-privilege tokens and RBAC.
+```
+kubernetes>=29.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+azure-identity>=1.15.0
+azure-mgmt-containerservice>=28.0.0
+pyyaml>=6.0
+```
