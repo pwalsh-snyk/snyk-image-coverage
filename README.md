@@ -1,6 +1,6 @@
 # snyk-deployed-image-coverage
 
-Automatically reconcile container images running in your AKS clusters with Snyk container projects. Import images that are deployed but not yet scanned, tag them so you can find them later, and clean up Snyk projects for images that are no longer running — all without kubectl or a local kubeconfig.
+Automatically reconcile container images running in your AKS clusters with Snyk container projects. On each run it **re-imports** every deployed image (so Snyk picks up new vulnerabilities and policy), tags projects so you can find them later, and cleans up Snyk projects for images that are no longer running — all without kubectl or a local kubeconfig.
 
 ---
 
@@ -12,10 +12,9 @@ On each run it:
 
 1. Discovers all AKS clusters in your Azure subscription(s) using the Azure SDK (no kubectl required).
 2. Collects every image reference from running pods — both the `spec` tag string and the resolved `sha256` digest from `status.containerStatuses[].image_id`.
-3. Pages through your Snyk org's projects and builds a set of known image refs and digests.
-4. Imports any cluster image that doesn't already have a Snyk project, routing to the right registry integration by hostname.
-5. Tags newly imported projects `image=deployed` (configurable) so you can filter in the Snyk UI.
-6. Deletes Snyk projects tagged `image=deployed` whose image is no longer running, then removes the orphaned Snyk target if no projects remain.
+3. Triggers a Snyk v1 import for **each** distinct deployed image (after digest dedupe), every run — routing to the right registry integration by hostname — so images are re-scanned on a schedule, not only on first sight.
+4. Tags projects `image=deployed` (configurable) after successful imports so you can filter in the Snyk UI.
+5. Deletes Snyk projects tagged `image=deployed` whose image is no longer running, then removes the orphaned Snyk target if no projects remain.
 
 ---
 
@@ -108,7 +107,7 @@ SNYK_CLEANUP_REQUIRE_TAG=1      # set to 0 to match all container projects, not 
 ## Usage
 
 ```bash
-# Standard run: discover clusters, import missing images, clean up stale projects
+# Standard run: discover clusters, re-import all deployed images, clean up stale projects
 python reconcile.py
 
 # Preview deletions without calling the Snyk delete API
@@ -154,7 +153,7 @@ Each cluster image goes through two representations:
 - **Spec ref** — what's in `pod.spec.containers[].image`, e.g. `myregistry.azurecr.io/app:v1.2.3`
 - **Digest ref** — what's in `pod.status.containerStatuses[].image_id`, e.g. `myregistry.azurecr.io/app@sha256:abc123...`
 
-Both are normalized (lowercase, whitespace stripped, `docker-pullable://` prefix removed) before comparison against Snyk project names. If a `sha256` digest appears in either side of the comparison, it's used directly — so a tag bump that points to the same underlying image won't trigger a re-import.
+Both are normalized (lowercase, whitespace stripped, `docker-pullable://` prefix removed). The script **imports** every deduplicated image on every run; **cleanup** uses the same normalized keys to decide which tagged Snyk projects still match a running workload. If a `sha256` digest appears on either side, it's used directly — so a tag bump that resolves to the same digest still counts as one import target after dedupe.
 
 When a spec ref and a digest ref refer to the same content (matched via repo path + digest), they're deduplicated to a single import target.
 

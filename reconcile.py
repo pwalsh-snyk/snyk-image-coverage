@@ -9,9 +9,9 @@ Flow:
      a resource group) and fetch per-cluster kubeconfigs via the Azure API.
   3. Query pod images from each cluster (spec image + status containerStatuses image_id digests),
      from pods in **Running** phase only by default (avoids stale images from Succeeded/Failed Job pods).
-  4. Paginate Snyk REST projects and build a set of known image refs and sha256 keys.
-  5. For images not matched, POST to the Snyk v1 import API using the integration
-     that matches the image registry.
+  4. For every distinct cluster image (after digest dedupe), POST to the Snyk v1 import API using
+     the integration that matches the image registry — **every run**, so Snyk re-scans/re-imports
+     deployed images even when projects already exist.
 
 Environment variables (set in .env):
   Required:
@@ -39,7 +39,7 @@ Environment variables (set in .env):
     SNYK_REST_BASE         Snyk REST API base (default: https://api.snyk.io)
     SNYK_V1_BASE           Snyk v1 API base (default: https://snyk.io)
     SNYK_REST_VERSION      REST API version (default: 2024-10-15)
-    SNYK_DEBUG             If 1/true: DEBUG logging (first project attributes, snyk_project_image_keys).
+    SNYK_DEBUG             If 1/true: DEBUG logging (per-project keys during cleanup matching).
 
   Optional tagging (after each successful import job completes):
     SNYK_TAG_IMPORTED_PROJECTS  If unset or 1/true/yes: apply Snyk project tags (default on).
@@ -78,7 +78,7 @@ After imports, remove stale projects that were tagged by this tool (see cleanup 
 Preview deletions without calling the API:
   python reconcile.py --dry-run
 
-Debug (Snyk REST project attributes / matching keys):
+Debug (per-project matching keys during cleanup):
   python reconcile.py --debug
   # or SNYK_DEBUG=1
 
@@ -1255,7 +1255,7 @@ def main() -> int:
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Enable DEBUG logging (first project attributes, per-project snyk_project_image_keys).",
+        help="Enable DEBUG logging (per-project keys during cleanup image matching).",
     )
     args = parser.parse_args()
 
@@ -1329,7 +1329,6 @@ def main() -> int:
         print("No images found — nothing to reconcile.")
         return 0
 
-    # --- Fetch Snyk projects ---
     rest_session = requests.Session()
     rest_session.headers.update({
         "Authorization": f"token {token}",
@@ -1342,73 +1341,47 @@ def main() -> int:
         "Content-Type": "application/json; charset=utf-8",
     })
 
-    print("\nFetching Snyk projects...", flush=True)
-    known: set[str] = set()
-    project_count = 0
-    first_project_logged = False
-    try:
-        for proj in iter_snyk_projects(rest_session, rest_base, org_id, rest_version):
-            project_count += 1
-            if not first_project_logged:
-                first_project_logged = True
-                log.debug("First project full attributes: %s", proj.get("attributes"))
-            if not is_likely_container_project(proj):
-                continue
-            known.update(snyk_project_image_keys(proj))
-    except requests.HTTPError as e:
-        detail = f" Body: {e.response.text[:500]}" if e.response is not None else ""
-        print(f"Snyk REST API request failed: {e}.{detail}", file=sys.stderr)
-        return 1
-    except requests.RequestException as e:
-        print(f"Snyk REST API unreachable: {e}", file=sys.stderr)
-        return 1
-
-    print(f"Scanned {project_count} Snyk projects; {len(known)} normalized image keys for matching.")
-
-    # --- Reconcile ---
-    missing: list[str] = []
-    for img in sorted(cluster_images):
-        if cluster_image_matches_snyk(img, known):
-            continue
-        missing.append(img)
+    # --- Import (every run: re-trigger Snyk import for each deployed image) ---
+    to_import = sorted(cluster_images)
+    print(
+        f"\nImporting {len(to_import)} cluster image(s) "
+        "(reimport every run; integration id chosen per registry).",
+        flush=True,
+    )
+    for m in to_import:
+        print(f"  - {m}")
 
     failures = 0
-    if not missing:
-        print("All cluster images appear to have a matching Snyk project.")
-    else:
-        print(f"\n{len(missing)} images not matched; importing:")
-        for m in missing:
-            print(f"  - {m}")
-        if tag_pairs:
-            print(
-                f"\nAfter each import completes, projects get tag "
-                f"{tag_key}={tag_value} "
-                f"(override with SNYK_IMPORT_TAG_*; disable with SNYK_TAG_IMPORTED_PROJECTS=0).",
-                flush=True,
-            )
+    if tag_pairs:
+        print(
+            f"\nAfter each import completes, projects get tag "
+            f"{tag_key}={tag_value} "
+            f"(override with SNYK_IMPORT_TAG_*; disable with SNYK_TAG_IMPORTED_PROJECTS=0).",
+            flush=True,
+        )
 
-        for img in missing:
-            iid = integration_id_for_image(img, routing)
-            ok, detail = import_image_v1(v1_session, v1_base, org_id, iid, img)
-            if not ok:
-                print(f"Import failed: {img} -> {detail}", file=sys.stderr)
+    for img in to_import:
+        iid = integration_id_for_image(img, routing)
+        ok, detail = import_image_v1(v1_session, v1_base, org_id, iid, img)
+        if not ok:
+            print(f"Import failed: {img} -> {detail}", file=sys.stderr)
+            failures += 1
+            continue
+        print(f"Import started: {img} -> {detail}")
+        poll_for_job = bool(detail) and (args.wait_import or bool(tag_pairs))
+        if poll_for_job and detail:
+            try:
+                final = poll_import_job(v1_session, detail)
+            except Exception as e:
+                print(f"  import job poll failed ({img}): {e}", file=sys.stderr)
                 failures += 1
                 continue
-            print(f"Import started: {img} -> {detail}")
-            poll_for_job = bool(detail) and (args.wait_import or bool(tag_pairs))
-            if poll_for_job and detail:
-                try:
-                    final = poll_import_job(v1_session, detail)
-                except Exception as e:
-                    print(f"  import job poll failed ({img}): {e}", file=sys.stderr)
-                    failures += 1
-                    continue
-                if args.wait_import:
-                    print(f"  job status: {final.get('status')} {final.get('error', '')}")
-                if tag_pairs:
-                    failures += tag_projects_from_import_job(
-                        v1_session, v1_base, org_id, final, tag_pairs, context=img
-                    )
+            if args.wait_import:
+                print(f"  job status: {final.get('status')} {final.get('error', '')}")
+            if tag_pairs:
+                failures += tag_projects_from_import_job(
+                    v1_session, v1_base, org_id, final, tag_pairs, context=img
+                )
 
     failures += cleanup_stale_deployed_projects(
         rest_session,
