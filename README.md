@@ -31,12 +31,49 @@ On each run it:
 
 ## Setup
 
+**1. Clone and create a virtual environment**
+
 ```bash
 git clone https://github.com/pwalsh-snyk/snyk-image-coverage
 cd snyk-image-coverage
-pip install -r requirements.txt
-cp .env.example .env   # then fill in your values
+
+python3 -m venv .venv
 ```
+
+A virtual environment keeps this project's dependencies isolated from the rest of your system Python — nothing else on your machine gets affected.
+
+**2. Install dependencies**
+
+```bash
+.venv/bin/pip install -r requirements.txt
+```
+
+**3. Configure your environment**
+
+```bash
+cp .env.example .env
+# open .env and fill in your values
+```
+
+**4. Authenticate to Azure**
+
+```bash
+az login
+```
+
+---
+
+## Running the script
+
+Always use the Python interpreter from the virtual environment:
+
+```bash
+.venv/bin/python reconcile.py
+```
+
+Using `.venv/bin/python` instead of just `python` ensures you're running against the installed dependencies, not your system Python. On Windows, the path is `.venv\Scripts\python`.
+
+The `2>&1` you may see in examples (e.g. in a cron job) redirects error output into the same stream as normal output, so both end up in the same log file. You don't need it when running interactively in a terminal.
 
 ### .env
 
